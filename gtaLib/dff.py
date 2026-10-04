@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 from collections import defaultdict, namedtuple
-from struct import unpack_from, calcsize, pack
+from struct import unpack_from, calcsize, pack, error as StructError
 from enum import Enum, IntEnum
 
 from .pyffi.utils import tristrip
@@ -40,6 +40,80 @@ def decode_text(data):
             continue
 
     return data.decode("utf-8", "replace")
+
+#######################################################
+def cstr_length(data, offset=0, limit=None):
+    """Length of the NUL terminated string at offset.
+
+    Unlike strlen() this does not stop at the first non-ASCII byte, so
+    east-asian node names survive.  ``limit`` caps the scan at the end of
+    the enclosing chunk, which is what we want for chunks that store the
+    string without a terminator (GTA does that).
+    """
+
+    if limit is None:
+        limit = len(data)
+
+    end = data.find(b"\x00", offset, limit)
+    if end < 0:
+        end = limit
+
+    return end - offset
+
+#######################################################
+# RenderWare's User Data plugin is a free-form container, so every exporter
+# picks its own section name to stash the node (= frame) name in:
+#   GTA / 轩辕剑  -> "name\0"
+#   仙剑奇侠传五系 -> "prt"
+#   轩辕剑 场景模型 -> "test"
+NODE_NAME_SECTIONS = ("name", "prt", "test")
+
+# Free-form exporter metadata that must never be mistaken for a node name.
+# (3ds Max writes its Reactor/physics settings into a section with this name.)
+NODE_NAME_SECTION_IGNORE = ("3dsmax user properties",)
+
+def strip_node_name_tag(name):
+    """Drop the "[@c]" tag some exporters prefix onto helper nodes.
+
+    e.g. "[@2]Bip01 Prop2" -> "Bip01 Prop2".  A tag with nothing behind it
+    ("[@g]") is kept as-is so that we never produce an empty name.
+    """
+
+    if name.startswith("[@") and len(name) > 4 and name[3] == "]":
+        return name[4:]
+
+    return name
+
+def get_node_name(user_data):
+    """Extract the node (frame) name stored in a User Data PLG.
+
+    Returns None when the plugin carries no usable name.
+    """
+
+    if user_data is None:
+        return None
+
+    fallback = None
+    for section in user_data.sections:
+
+        # Sections hold an element list; we only care about string data.
+        if not section.data or not isinstance(section.data[0], str):
+            continue
+
+        key = section.name.split("\x00", 1)[0].strip().lower()
+        if key in NODE_NAME_SECTION_IGNORE:
+            continue
+
+        name = strip_node_name_tag(section.data[0].split("\x00", 1)[0].strip())
+        if not name:
+            continue
+
+        if key in NODE_NAME_SECTIONS:
+            return name
+        if fallback is None:
+            fallback = name
+
+    return fallback
 
 # Data types
 Chunk         = namedtuple("Chunk"         , "type size version")
@@ -613,41 +687,48 @@ class UserData:
     def from_mem(data):
 
         self = UserData()
-        
-        num_sections = unpack_from("<I", data)[0]
-        offset = 4
-        
-        for i in range(num_sections):
 
-            # Section name
-            name_len = unpack_from("<I", data, offset)[0]
-            name = decode_text(unpack_from("<%ds" % (name_len), data,
-                                           offset + 4)[0])
+        # The plugin is free-form, so a payload we do not understand is a
+        # real possibility.  Never let that abort the whole import: keep
+        # whatever sections we managed to read.
+        try:
+            num_sections = unpack_from("<I", data)[0]
+            offset = 4
 
-            offset += name_len + 4
+            for i in range(num_sections):
 
-            # Elements
-            element_type, num_elements = unpack_from("<II", data, offset)
-            offset += 8
-            
-            elements = []
-            if element_type == UserDataType.USERDATAINT:
-                elements = list(unpack_from("<%dI" % (num_elements), data, offset))
-                offset += 4 * num_elements
+                # Section name
+                name_len = unpack_from("<I", data, offset)[0]
+                name = decode_text(unpack_from("<%ds" % (name_len), data,
+                                               offset + 4)[0])
 
-            elif element_type == UserDataType.USERDATAFLOAT:
-                elements = list(unpack_from("<%df" % (num_elements), data, offset))
-                offset += 4 * num_elements
+                offset += name_len + 4
 
-            elif element_type == UserDataType.USERDATASTRING:
-                for j in range(num_elements):
-                    str_len = unpack_from("<I", data, offset)[0]
-                    string = unpack_from("<%ds" % (str_len), data, offset + 4)[0]
-                    elements.append(decode_text(string))
-                    
-                    offset += 4 + str_len
+                # Elements
+                element_type, num_elements = unpack_from("<II", data, offset)
+                offset += 8
 
-            self.sections.append (UserDataSection(name, elements))
+                elements = []
+                if element_type == UserDataType.USERDATAINT:
+                    elements = list(unpack_from("<%dI" % (num_elements), data, offset))
+                    offset += 4 * num_elements
+
+                elif element_type == UserDataType.USERDATAFLOAT:
+                    elements = list(unpack_from("<%df" % (num_elements), data, offset))
+                    offset += 4 * num_elements
+
+                elif element_type == UserDataType.USERDATASTRING:
+                    for j in range(num_elements):
+                        str_len = unpack_from("<I", data, offset)[0]
+                        string = unpack_from("<%ds" % (str_len), data, offset + 4)[0]
+                        elements.append(decode_text(string))
+
+                        offset += 4 + str_len
+
+                self.sections.append (UserDataSection(name, elements))
+
+        except StructError:
+            pass
 
         return self
 
@@ -2303,7 +2384,11 @@ class Clump:
                 animation_data = None
 
                 if chunk.type == types["Frame"]:
-                    name = decode_text(self.raw(strlen(self.data, self.pos)))
+                    name = strip_node_name_tag(
+                        decode_text(self.raw(
+                            cstr_length(self.data, self.pos, self.pos + chunk.size)))
+                        .split("\x00", 1)[0].strip()
+                    )
                     
                 elif chunk.type == types["HAnim PLG"]:
                     bone_data = HAnimPLG.from_mem(self.raw(chunk.size))
@@ -2315,16 +2400,15 @@ class Clump:
                     animation_data = AnimationPLG.from_mem(self.data[self.pos:])
 
                 self._read(chunk.size)
-                if name is not None:
+                if name:
                     self.frame_list[i].name = name
                 if bone_data is not None:
                     self.frame_list[i].bone_data = bone_data
                 if user_data is not None:
                     self.frame_list[i].user_data = user_data
-                    for section in user_data.sections:
-                        if section.name == "name\0":
-                            self.frame_list[i].name = section.data[0]
-                            break
+                    node_name = get_node_name(user_data)
+                    if node_name is not None:
+                        self.frame_list[i].name = node_name
                 if animation_data is not None:
                     self.frame_list[i].animation_data = animation_data
 
